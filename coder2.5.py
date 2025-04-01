@@ -7,15 +7,20 @@ import argparse
 import json
 from optimum.bettertransformer import BetterTransformer
 
+HF_TOKEN = ""
 
 # Constants for available models
 class Models:
-    QWEN_0_5B = "Qwen/Qwen2.5-Coder-0.5B-Instruct"
-    QWEN_1_5B = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
-    QWEN_3B = "Qwen/Qwen2.5-Coder-3B-Instruct"
-    STAR_CODER_3B = "bigcode/starcoder2-3b"
+    QWEN_0_5B_INSTRUCT = "Qwen/Qwen2.5-Coder-0.5B-Instruct"
+    QWEN_1_5B_INSTRUCT = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
+    QWEN_3B_INSTRUCT = "Qwen/Qwen2.5-Coder-3B-Instruct"
+    DEEPSEEK_1_3B_CODE = "deepseek-ai/deepseek-coder-1.3b-instruct"
 
-    DEFAULT = QWEN_0_5B
+    DEFAULT = QWEN_0_5B_INSTRUCT
+    # DEFAULT = "microsoft/Phi-3.5-mini-instruct"
+    # DEFAULT = "EleutherAI/pythia-1.4b"
+    # DEFAULT = "stabilityai/stablelm-2-1_6b"
+
 
     @classmethod
     def get_cache_dir(cls, model_name):
@@ -59,8 +64,8 @@ class ModelManager:
     def initialize(self):
         """Set up the environment and configuration for model loading"""
         # Set environment variables for optimization
-        os.environ["TOKENIZERS_PARALLELISM"] = "false"
-        os.environ["OMP_NUM_THREADS"] = str(min(8, os.cpu_count() or 1))
+        # os.environ["TOKENIZERS_PARALLELISM"] = "false"
+        # os.environ["OMP_NUM_THREADS"] = str(min(8, os.cpu_count() or 1))
 
         # Enable CUDA optimizations
         torch.backends.cudnn.benchmark = True
@@ -68,7 +73,8 @@ class ModelManager:
 
         print(f"Using device: {self.device}")
 
-    def print_cuda_info(self):
+    @staticmethod
+    def print_cuda_info():
         """Print CUDA availability information"""
         print(f"CUDA available: {torch.cuda.is_available()}")
         if torch.cuda.is_available():
@@ -97,18 +103,19 @@ class ModelManager:
         self.print_cuda_info()
 
         self.model = self._load_fresh_model()
+        # self.model.eval()
+        for param in self.model.parameters():
+            param.requires_grad = False
 
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, use_fast=True)
-
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.model_name,
+            use_fast=True,
+            token=HF_TOKEN,
+            trust_remote_code=True
+        )
         # Ensure tokenizer has a pad_token
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-
-        # Optimize model for inference
-        self.model.eval()
-
-        for param in self.model.parameters():
-            param.requires_grad = False
 
         # Warm up the model
         self._warm_up_model()
@@ -125,8 +132,12 @@ class ModelManager:
                 self.model = AutoModelForCausalLM.from_pretrained(
                     model_path,
                     torch_dtype=torch.bfloat16,
+                    # torch_dtype=torch.int8,
                     device_map="auto",
                     low_cpu_mem_usage=True,
+                    use_cache=True,
+                    token=HF_TOKEN,
+                    trust_remote_code=True
                 )
                 return True
             except Exception as e:
@@ -144,16 +155,20 @@ class ModelManager:
 
     def _load_fresh_model(self):
         """Load model with optimizations"""
+        device_map = "cuda" if torch.cuda.is_available() else "auto"
         try:
             # First attempt to load with Flash Attention 2
             print("Attempting to load model with Flash Attention...")
             model = AutoModelForCausalLM.from_pretrained(
                 self.model_name,
                 torch_dtype=torch.bfloat16,
-                device_map="auto",
+                device_map=device_map,
                 low_cpu_mem_usage=True,
                 use_cache=True,
+                # attn_implementation="eager",
                 attn_implementation="flash_attention_2",
+                token=HF_TOKEN,
+                trust_remote_code=True
             )
             print("Successfully loaded model with Flash Attention!")
             return model
@@ -167,14 +182,18 @@ class ModelManager:
                 device_map="auto",
                 low_cpu_mem_usage=True,
                 use_cache=True,
+                token=HF_TOKEN,
+                trust_remote_code=True
             )
 
-            if torch.cuda.is_available():
-                model = model.half().to(self.device)
-            else:
-                model = model.to(self.device)
+            # if torch.cuda.is_available():
+            #     model = model.half().to(self.device)
+            # else:
+            #     model = model.to(self.device)
+            # model = model.to(self.device)
 
-            return BetterTransformer.transform(model)
+            # return BetterTransformer.transform(model)
+            return model.to(self.device).eval()
 
     def _warm_up_model(self):
         """Warm up the model to initialize CUDA kernels"""
@@ -182,9 +201,10 @@ class ModelManager:
         dummy_input = "Hello, this is a warm-up."
         inputs = self.tokenizer([dummy_input], return_tensors="pt").to(self.model.device)
         with torch.no_grad(), torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-            _ = self.model(**{k: v for k, v in inputs.items() if k != 'token_type_ids'}, max_length=1)
+            _ = self.model(**{k: v for k, v in inputs.items() if k != 'token_type_ids'})
 
-    def _free_memory(self):
+    @staticmethod
+    def _free_memory():
         """Free up memory"""
         gc.collect()
         torch.cuda.empty_cache()
@@ -206,7 +226,7 @@ class TextGenerator:
     def __init__(self, model_manager):
         self.model_manager = model_manager
 
-    def generate(self, messages, max_tokens=512, temperature=0.7, do_sample=True, show_output=True):
+    def generate(self, messages, max_tokens=50, temperature=0.8, do_sample=True, show_output=True):
         """Generate text from messages using the model"""
         if not self.model_manager.model or not self.model_manager.tokenizer:
             raise ValueError("Model not loaded")
@@ -238,7 +258,7 @@ class TextGenerator:
                 do_sample=do_sample,
                 temperature=temperature,
                 top_p=0.9,
-                top_k=10 if do_sample else 50,
+                top_k=10 if do_sample else 12,
                 use_cache=True,
                 streamer=streamer,
                 num_beams=1,
@@ -260,7 +280,7 @@ class TextGenerator:
 class LogChunker:
     """Handles splitting log files into processable chunks"""
 
-    def __init__(self, tokenizer, max_chunk_tokens=10000, overlap_tokens=200):
+    def __init__(self, tokenizer, max_chunk_tokens=8000, overlap_tokens=100):
         self.tokenizer = tokenizer
         self.max_chunk_tokens = max_chunk_tokens
         self.overlap_tokens = overlap_tokens
@@ -331,7 +351,8 @@ class LogChunker:
 
         return chunks
 
-    def _add_chunk(self, chunks, chunk_lines, start_line):
+    @staticmethod
+    def _add_chunk(chunks, chunk_lines, start_line):
         """Add a new chunk to the chunks list"""
         chunk_text = "\n".join(chunk_lines)
         chunks.append({
@@ -370,8 +391,8 @@ class LogAnalyzer:
 
         # Analysis configuration
         self.max_chunk_tokens = 10000
-        self.overlap_tokens = 200
-        self.max_analysis_tokens = 3000
+        self.overlap_tokens = 100
+        self.max_analysis_tokens = 512
 
     def _ensure_model_loaded(self):
         """Ensure model is loaded before proceeding"""
@@ -442,7 +463,7 @@ class LogAnalyzer:
         result = self.text_generator.generate(
             messages=messages,
             max_tokens=2048,
-            temperature=0.7
+            temperature=0.8
         )
 
         return {
@@ -475,7 +496,8 @@ class LogAnalyzer:
 
         return combined_analyses
 
-    def _truncate_analyses(self, analyses):
+    @staticmethod
+    def _truncate_analyses(analyses):
         """Truncate analyses to fit within token limits"""
         max_chars_per_analysis = int(30000 / len(analyses))
         truncated_analyses = ""
@@ -492,7 +514,8 @@ class LogAnalyzer:
 
         return truncated_analyses
 
-    def _collect_all_issues(self, analyses):
+    @staticmethod
+    def _collect_all_issues(analyses):
         """Collect all detected issues from all analyses"""
         all_issues = []
         for analysis in analyses:
@@ -523,14 +546,16 @@ class LogAnalyzer:
 
         return final_result
 
-    def _save_intermediate_result(self, analysis, output_file, chunk_index):
+    @staticmethod
+    def _save_intermediate_result(analysis, output_file, chunk_index):
         """Save intermediate analysis result"""
         intermediate_file = f"{output_file}.chunk{chunk_index + 1}.json"
         with open(intermediate_file, 'w', encoding='utf-8') as f:
             json.dump(analysis, f, indent=2)
         print(f"Saved intermediate analysis to {intermediate_file}")
 
-    def _save_results(self, final_result, output_file):
+    @staticmethod
+    def _save_results(final_result, output_file):
         """Save final analysis results to files"""
         # Save JSON result
         with open(output_file, 'w', encoding='utf-8') as f:
@@ -561,12 +586,12 @@ class LogAnalyzer:
 
 def main():
     parser = argparse.ArgumentParser(description="Analyze large log files with AI")
-    parser.add_argument('--log_file', help='Path to the log file to analyze', default="./Jenkins_bad.txt")
+    parser.add_argument('--log_file', help='Path to the log file to analyze', default="./Android_2k.log.txt")
     parser.add_argument('--output', '-o', help='Output file for the analysis (JSON format)')
     parser.add_argument('--model', default=Models.DEFAULT, help='Model to use for analysis')
     parser.add_argument('--cache-dir', default=None, help='Directory to cache the model')
     parser.add_argument('--max-chunk-tokens', type=int, default=10000, help='Maximum tokens per chunk')
-    parser.add_argument('--overlap-tokens', type=int, default=200, help='Overlap tokens between chunks')
+    parser.add_argument('--overlap-tokens', type=int, default=100, help='Overlap tokens between chunks')
 
     args = parser.parse_args()
 
